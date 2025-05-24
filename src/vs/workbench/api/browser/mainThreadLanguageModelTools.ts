@@ -6,10 +6,10 @@
 import { CancellationToken } from '../../../base/common/cancellation.js';
 import { Disposable, DisposableMap } from '../../../base/common/lifecycle.js';
 import { revive } from '../../../base/common/marshalling.js';
-import { CountTokensCallback, ILanguageModelToolsService, IToolData, IToolInvocation, IToolProgressStep, IToolResult, ToolProgress } from '../../contrib/chat/common/languageModelToolsService.js';
+import { CountTokensCallback, ILanguageModelToolsService, IToolInvocation, IToolProgressStep, IToolResult, ToolProgress, toolResultHasBuffers } from '../../contrib/chat/common/languageModelToolsService.js';
 import { IExtHostContext, extHostNamedCustomer } from '../../services/extensions/common/extHostCustomers.js';
-import { Dto } from '../../services/extensions/common/proxyIdentifier.js';
-import { ExtHostContext, ExtHostLanguageModelToolsShape, MainContext, MainThreadLanguageModelToolsShape } from '../common/extHost.protocol.js';
+import { Dto, SerializableObjectWithBuffers } from '../../services/extensions/common/proxyIdentifier.js';
+import { ExtHostContext, ExtHostLanguageModelToolsShape, IToolDataDto, MainContext, MainThreadLanguageModelToolsShape } from '../common/extHost.protocol.js';
 
 @extHostNamedCustomer(MainContext.MainThreadLanguageModelTools)
 export class MainThreadLanguageModelTools extends Disposable implements MainThreadLanguageModelToolsShape {
@@ -28,14 +28,27 @@ export class MainThreadLanguageModelTools extends Disposable implements MainThre
 		super();
 		this._proxy = extHostContext.getProxy(ExtHostContext.ExtHostLanguageModelTools);
 
-		this._register(this._languageModelToolsService.onDidChangeTools(e => this._proxy.$onDidChangeTools([...this._languageModelToolsService.getTools()])));
+		this._register(this._languageModelToolsService.onDidChangeTools(e => this._proxy.$onDidChangeTools(this.getToolDtos())));
 	}
 
-	async $getTools(): Promise<IToolData[]> {
-		return Array.from(this._languageModelToolsService.getTools());
+	private getToolDtos(): IToolDataDto[] {
+		return Array.from(this._languageModelToolsService.getTools())
+			.map(tool => ({
+				id: tool.id,
+				displayName: tool.displayName,
+				toolReferenceName: tool.toolReferenceName,
+				tags: tool.tags,
+				userDescription: tool.userDescription,
+				modelDescription: tool.modelDescription,
+				inputSchema: tool.inputSchema,
+			} satisfies IToolDataDto));
 	}
 
-	async $invokeTool(dto: IToolInvocation, token?: CancellationToken): Promise<Dto<IToolResult>> {
+	async $getTools(): Promise<IToolDataDto[]> {
+		return this.getToolDtos();
+	}
+
+	async $invokeTool(dto: IToolInvocation, token?: CancellationToken): Promise<Dto<IToolResult> | SerializableObjectWithBuffers<Dto<IToolResult>>> {
 		const result = await this._languageModelToolsService.invokeTool(
 			dto,
 			(input, token) => this._proxy.$countTokensForInvocation(dto.callId, input, token),
@@ -43,9 +56,8 @@ export class MainThreadLanguageModelTools extends Disposable implements MainThre
 		);
 
 		// Don't return extra metadata to EH
-		return {
-			content: result.content,
-		};
+		const out: Dto<IToolResult> = { content: result.content };
+		return toolResultHasBuffers(result) ? new SerializableObjectWithBuffers(out) : out;
 	}
 
 	$acceptToolProgress(callId: string, progress: IToolProgressStep): void {
@@ -68,8 +80,9 @@ export class MainThreadLanguageModelTools extends Disposable implements MainThre
 				invoke: async (dto, countTokens, progress, token) => {
 					try {
 						this._runningToolCalls.set(dto.callId, { countTokens, progress });
-						const resultDto = await this._proxy.$invokeTool(dto, token);
-						return revive(resultDto) as IToolResult;
+						const resultSerialized = await this._proxy.$invokeTool(dto, token);
+						const resultDto: Dto<IToolResult> = resultSerialized instanceof SerializableObjectWithBuffers ? resultSerialized.value : resultSerialized;
+						return revive<IToolResult>(resultDto);
 					} finally {
 						this._runningToolCalls.delete(dto.callId);
 					}
